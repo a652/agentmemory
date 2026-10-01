@@ -12,6 +12,7 @@ vi.mock("iii-sdk", async (importOriginal) => {
 });
 
 import { registerApiTriggers } from "../src/triggers/api.js";
+import { registerEventTriggers } from "../src/triggers/events.js";
 import { KV } from "../src/state/schema.js";
 import type { Session } from "../src/types.js";
 
@@ -69,6 +70,7 @@ function makeHarness(sessionRows: Array<[string, unknown]> = []) {
   };
 
   registerApiTriggers(sdk as never, kv as never);
+  registerEventTriggers(sdk as never, kv as never);
 
   return { functions, kv, store, trigger, update };
 }
@@ -175,5 +177,70 @@ describe("session lifecycle API", () => {
     expect(response.body.sessions).toEqual([valid]);
     expect(harness.kv.get).toHaveBeenCalledWith(KV.summaries, valid.id);
     expect(harness.kv.get).not.toHaveBeenCalledWith(KV.summaries, undefined);
+  });
+});
+
+describe("event::session::ended", () => {
+  it("ignores an unknown session without creating a partial row", async () => {
+    const harness = makeHarness();
+    const handler = harness.functions.get("event::session::ended")!;
+
+    const result = await handler({ sessionId: "agent:dmp-pm:direct:test" });
+
+    expect(result).toEqual({ success: true, ended: false, reason: "not_found" });
+    expect(harness.update).not.toHaveBeenCalled();
+    expect(harness.store.get(KV.sessions)).toEqual(new Map());
+  });
+
+  it("ignores a malformed session id", async () => {
+    const harness = makeHarness();
+    const handler = harness.functions.get("event::session::ended")!;
+
+    const result = await handler({});
+
+    expect(result).toEqual({ success: true, ended: false, reason: "not_found" });
+    expect(harness.kv.get).not.toHaveBeenCalled();
+    expect(harness.update).not.toHaveBeenCalled();
+  });
+
+  it("does not treat an existing partial row as a valid session", async () => {
+    const sessionId = "agent:dmp-pm:direct:partial";
+    const harness = makeHarness([[sessionId, { status: "active" }]]);
+    const handler = harness.functions.get("event::session::ended")!;
+
+    const result = await handler({ sessionId });
+
+    expect(result).toEqual({ success: true, ended: false, reason: "not_found" });
+    expect(harness.update).not.toHaveBeenCalled();
+  });
+
+  it("leaves an already-completed session untouched", async () => {
+    const sessionId = "agent:dmp-pm:direct:completed";
+    const harness = makeHarness([[sessionId, session(sessionId, "completed")]]);
+    const handler = harness.functions.get("event::session::ended")!;
+
+    const result = await handler({ sessionId });
+
+    expect(result).toEqual({
+      success: true,
+      ended: false,
+      reason: "already_completed",
+    });
+    expect(harness.update).not.toHaveBeenCalled();
+  });
+
+  it("completes an existing active session", async () => {
+    const sessionId = "agent:dmp-pm:direct:existing";
+    const harness = makeHarness([[sessionId, session(sessionId)]]);
+    const handler = harness.functions.get("event::session::ended")!;
+
+    const result = await handler({ sessionId });
+
+    expect(result).toEqual({ success: true, ended: true });
+    expect(harness.store.get(KV.sessions)?.get(sessionId)).toMatchObject({
+      id: sessionId,
+      status: "completed",
+      endedAt: expect.any(String),
+    });
   });
 });
